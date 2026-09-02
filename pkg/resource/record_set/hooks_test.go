@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	svcapitypes "github.com/aws-controllers-k8s/route53-controller/apis/v1alpha1"
-	ackrequeue "github.com/aws-controllers-k8s/runtime/pkg/requeue"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	smithy "github.com/aws/smithy-go"
 )
@@ -138,32 +137,32 @@ func (e *changeBatchErr) ErrorFault() smithy.ErrorFault {
 	return smithy.FaultClient
 }
 
-func Test_requeueOnTransientChangeBatchError(t *testing.T) {
+func Test_demoteTransientChangeBatchError(t *testing.T) {
 	tests := []struct {
-		testName    string
-		in          error
-		wantRequeue bool // true => downgraded to *RequeueNeededAfter; false => returned unchanged
+		testName   string
+		in         error
+		wantDemote bool // true => downgraded to a plain non-terminal error; false => returned unchanged
 	}{
 		{
-			testName:    "nil error stays nil",
-			in:          nil,
-			wantRequeue: false,
+			testName:   "nil error stays nil",
+			in:         nil,
+			wantDemote: false,
 		},
 		{
-			testName: "transient: record already exists is requeued",
+			testName: "transient: record already exists is demoted",
 			in: &changeBatchErr{
 				code: "InvalidChangeBatch",
 				msg:  "[Tried to create resource record set [name='www.example.com.', type='A'] but it already exists]",
 			},
-			wantRequeue: true,
+			wantDemote: true,
 		},
 		{
-			testName: "transient: missing alias target is requeued",
+			testName: "transient: missing alias target is demoted",
 			in: &changeBatchErr{
 				code: "InvalidChangeBatch",
 				msg:  "[Tried to create an alias that targets d123.elb.amazonaws.com., type A in zone Z1, but the alias target name does not lie within the target zone]",
 			},
-			wantRequeue: true,
+			wantDemote: true,
 		},
 		{
 			testName: "terminal: malformed InvalidChangeBatch stays terminal",
@@ -171,7 +170,7 @@ func Test_requeueOnTransientChangeBatchError(t *testing.T) {
 				code: "InvalidChangeBatch",
 				msg:  "[RRSet with DNS name www.example.com. is not permitted in zone example.org.]",
 			},
-			wantRequeue: false,
+			wantDemote: false,
 		},
 		{
 			testName: "non-InvalidChangeBatch code is returned unchanged",
@@ -179,21 +178,30 @@ func Test_requeueOnTransientChangeBatchError(t *testing.T) {
 				code: "InvalidInput",
 				msg:  "some other problem",
 			},
-			wantRequeue: false,
+			wantDemote: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.testName, func(t *testing.T) {
-			got := requeueOnTransientChangeBatchError(tt.in)
-			var requeued *ackrequeue.RequeueNeededAfter
-			isRequeue := errors.As(got, &requeued)
-			if isRequeue != tt.wantRequeue {
-				t.Errorf("requeueOnTransientChangeBatchError() requeued = %v, want %v (err=%v)",
-					isRequeue, tt.wantRequeue, got)
+			got := demoteTransientChangeBatchError(tt.in)
+			// A demoted error must NOT unwrap to a smithy APIError at all: the
+			// generated terminalAWSError classifies via errors.As on the smithy
+			// code, so only a plain error escapes the terminal path. Errors left
+			// unchanged still unwrap to their original smithy APIError.
+			var apiErr smithy.APIError
+			carriesAPIErr := errors.As(got, &apiErr)
+			if demoted := got != nil && !carriesAPIErr; demoted != tt.wantDemote {
+				t.Errorf("demoteTransientChangeBatchError() demoted = %v, want %v (err=%v)",
+					demoted, tt.wantDemote, got)
 			}
-			// When not downgraded, the original error must pass through untouched.
-			if !tt.wantRequeue && got != nil && !errors.Is(got, tt.in) {
+			// A demoted error still surfaces the original message to the user.
+			if tt.wantDemote && got.Error() != tt.in.(*changeBatchErr).msg {
+				t.Errorf("expected demoted error to carry the original message %q, got %q",
+					tt.in.(*changeBatchErr).msg, got.Error())
+			}
+			// When not demoted, the original error must pass through untouched.
+			if !tt.wantDemote && got != nil && !errors.Is(got, tt.in) {
 				t.Errorf("expected original error to pass through unchanged, got %v", got)
 			}
 		})

@@ -1,3 +1,4 @@
 
-	// Retry transient InvalidChangeBatch failures instead of going terminal (community#2754).
-	err = requeueOnTransientChangeBatchError(err)
+	// Downgrade transient InvalidChangeBatch failures to recoverable so the
+	// controller backs off exponentially instead of going terminal (community#2754).
+	err = demoteTransientChangeBatchError(err)
