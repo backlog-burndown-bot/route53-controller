@@ -3,19 +3,50 @@ package record_set
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"time"
 
 	svcapitypes "github.com/aws-controllers-k8s/route53-controller/apis/v1alpha1"
 	ackcompare "github.com/aws-controllers-k8s/runtime/pkg/compare"
 	ackcondition "github.com/aws-controllers-k8s/runtime/pkg/condition"
 	ackerr "github.com/aws-controllers-k8s/runtime/pkg/errors"
+	ackrequeue "github.com/aws-controllers-k8s/runtime/pkg/requeue"
 	ackrtlog "github.com/aws-controllers-k8s/runtime/pkg/runtime/log"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	svcsdk "github.com/aws/aws-sdk-go-v2/service/route53"
 	svcsdktypes "github.com/aws/aws-sdk-go-v2/service/route53/types"
+	smithy "github.com/aws/smithy-go"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+// requeueOnTransientChangeBatchError downgrades the two transient
+// InvalidChangeBatch failures from #2754 (record already exists out of band, or
+// the alias target is not yet present) from terminal to a requeue, so the
+// controller keeps reconciling instead of latching ACK.Terminal until a pod
+// restart. Route53 reuses this code for genuinely-invalid batches too, so we
+// match on message and leave every other InvalidChangeBatch terminal.
+func requeueOnTransientChangeBatchError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) || apiErr.ErrorCode() != "InvalidChangeBatch" {
+		return err
+	}
+	msg := strings.ToLower(apiErr.ErrorMessage())
+	// Only the transient shapes from #2754 are reclassified; anything else
+	// under InvalidChangeBatch remains terminal.
+	if strings.Contains(msg, "already exists") ||
+		strings.Contains(msg, "alias target") {
+		return ackrequeue.NeededAfter(
+			fmt.Errorf("transient Route53 change-batch error, will retry: %w", err),
+			15*time.Second,
+		)
+	}
+	return err
+}
 
 // newResourceRecords returns a slice of ResourceRecord pointer objects
 // with values set by the resource's corresponding spec field.
@@ -211,7 +242,8 @@ func (rm *resourceManager) customUpdateRecordSet(
 		ko.Status.ID = nil
 		ko.Status.Status = nil
 		ko.Status.SubmittedAt = nil
-		return &resource{ko}, err
+		// Retry transient InvalidChangeBatch failures instead of going terminal (community#2754).
+		return &resource{ko}, requeueOnTransientChangeBatchError(err)
 	}
 
 	if resp.ChangeInfo.Id != nil {

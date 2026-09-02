@@ -357,6 +357,10 @@ func (rm *resourceManager) sdkCreate(
 	var resp *svcsdk.ChangeResourceRecordSetsOutput
 	_ = resp
 	resp, err = rm.sdkapi.ChangeResourceRecordSets(ctx, input)
+
+	// Retry transient InvalidChangeBatch failures instead of going terminal (community#2754).
+	err = requeueOnTransientChangeBatchError(err)
+
 	rm.metrics.RecordAPICall("CREATE", "ChangeResourceRecordSets", err)
 	if err != nil {
 		return nil, err
